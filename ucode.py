@@ -1,11 +1,8 @@
-# compiler.py
-
+# ucode.py
 # -*- coding: utf-8 -*-
 
-# ==============================================================================
-#  SEKCJA 0: IMPORT
-# ==============================================================================
 import csv
+import os
 
 try:
     from instructions import MICROCODE_MAP
@@ -14,9 +11,8 @@ except ImportError:
     print("Upewnij się, że plik z definicjami instrukcji znajduje się w tym samym folderze.")
     exit()
 
-# ##############################################################################
-# ## UNIWERSALNY GENERATOR MIKROKODU DLA PROCESORA 8501 (PROJEKT UŻYTKOWNIKA) ##
-# ##############################################################################
+# Konfiguracja folderu wyjściowego
+OUTPUT_DIR = "build"
 
 # ==============================================================================
 #  SEKCJA 1: DEFINICJE KODÓW STERUJĄCYCH
@@ -50,12 +46,9 @@ ADDR_SOURCE_CODES = {
 
 
 # ==============================================================================
-#  SEKCJA 2: GŁÓWNA LOGIKA - PARSER I ASSEMBLER
+#  SEKCJA 2: PARSER I ASSEMBLER
 # ==============================================================================
 def generate_microcode(symbolic_code: str) -> tuple[int, int, int]:
-    """
-    Tłumaczy symboliczną mikroinstrukcję na trzy 16-bitowe słowa sterujące.
-    """
     signals = {
         "alu_flags_ld": False, "alu_op_key": "none", "reg_a_load_en": False,
         "reg_x_load_en": False, "reg_y_load_en": False, "reg_sp_load_en": False,
@@ -69,7 +62,7 @@ def generate_microcode(symbolic_code: str) -> tuple[int, int, int]:
         "p_d_set_en": False, "p_d_clr_en": False, "p_i_set_en": False,
         "p_i_clr_en": False, "p_v_clr_en": False, "test_branch_en": False,
         "cpu_master_reset_en": False, "reset_cycle_counter_en": False,
-        "load_ir_en": False, "tmp_load_en": False
+        "load_ir_en": False, "tmp_load_en": False, "p_b_force_one_en": False
     }
 
     if not symbolic_code:
@@ -78,7 +71,9 @@ def generate_microcode(symbolic_code: str) -> tuple[int, int, int]:
     operations = [op.strip() for op in symbolic_code.lower().split(';')]
 
     for op in operations:
-        # --- Proste operacje ---
+        if not op: continue
+
+        # --- Proste flagi i operacje ---
         if op == "sp += 1":
             signals["sp_int_inc_en"] = True
         elif op == "sp -= 1":
@@ -89,20 +84,25 @@ def generate_microcode(symbolic_code: str) -> tuple[int, int, int]:
             signals["reset_cycle_counter_en"] = True
         elif op == "alu_flags_ld":
             signals["alu_flags_ld"] = True
+        elif op == "test_branch_en":
+            signals["test_branch_en"] = True
         elif op.startswith('clrf('):
             signals[f"p_{op[5:-1]}_clr_en"] = True
         elif op.startswith('setf('):
             signals[f"p_{op[5:-1]}_set_en"] = True
-        elif op == "test_branch_en":
-            signals["test_branch_en"] = True
-
-        # --- Operacje złożone ---
+        elif op.startswith('setf('):
+            flag_name = op[5:-1].lower()
+            if flag_name == 'b':
+                signals["p_b_force_one_en"] = True
+            else:
+                signals[f"p_{flag_name}_set_en"] = True
+        # --- Przypisania (:=) ---
         else:
             is_assignment = ":=" in op
             dest, source = (op.split(':=', 1) if is_assignment else ("", op))
             dest, source = dest.strip(), source.strip()
 
-            # --- Analiza Źródła ---
+            # 1. Modyfikatory źródła (+ X, + Y)
             if "+ x" in source:
                 signals["x_add_to_addr_en"] = True
                 source = source.replace("+ x", "").strip()
@@ -110,6 +110,7 @@ def generate_microcode(symbolic_code: str) -> tuple[int, int, int]:
                 signals["y_add_to_addr_en"] = True
                 source = source.replace("+ y", "").strip()
 
+            # 2. ALU Operations
             if '(' in source and source.endswith(')'):
                 op_key, operands = source.split('(', 1)
                 operands = operands[:-1].strip()
@@ -119,33 +120,48 @@ def generate_microcode(symbolic_code: str) -> tuple[int, int, int]:
                     signals["reg_out_key"] = reg_operand
                     source = mem_operand
                 else:
-                    signals["reg_out_key"] = operands
+                    if operands in REG_OUT_CODES:
+                        signals["reg_out_key"] = operands
                     source = ""
 
+            # 3. Analiza Źródła
             if source == "alu_result":
                 signals["alu_op_key"] = "out"
             elif source in REG_OUT_CODES:
                 signals["reg_out_key"] = source
             elif source in ["pch", "pcl"]:
                 signals[f"{source}_out_en"] = True
-
+            elif source.startswith('{') and source.endswith('}'):
+                special_key = source[1:-1]
+                if special_key in ADDR_SOURCE_CODES:
+                    signals["addr_source_key"] = special_key
+                    signals["addr_out_bus_en"] = True
             elif source.startswith('*'):
                 signals["mem_read_en"] = True
-                signals["data_bus_in_en"] = True  # To teraz zatrzaskuje DL
+                signals["data_bus_in_en"] = True
                 signals["addr_out_bus_en"] = True
                 source_addr = source[1:]
-                if source_addr == "{0x00, adl}":
-                    signals["addr_source_key"] = "zeropage"
-                elif source_addr == "{latch}" or source_addr == "{adh, adl}":
-                    signals["addr_source_key"] = "latch"
+                if source_addr.startswith('{') and source_addr.endswith('}'):
+                    key = source_addr[1:-1]
+                    if key == "0x00, adl":
+                        signals["addr_source_key"] = "zeropage"
+                    elif key == "latch":
+                        signals["addr_source_key"] = "latch"
+                    elif key == "adh, adl":
+                        signals["addr_source_key"] = "latch"
+                    elif key in ADDR_SOURCE_CODES:
+                        signals["addr_source_key"] = key
                 elif source_addr == "pc":
                     signals["addr_source_key"] = "pc"
-                # ... inne tryby odczytu
+                elif source_addr == "sp":
+                    signals["addr_source_key"] = "stack"
 
-            # --- Analiza Celu ---
+            # 4. Analiza Celu (Dest)
             if dest:
                 if dest in ["a", "x", "y", "sp", "p", "tmp", "ir", "adh", "adl"]:
                     signals[f"{'reg_' if dest not in ['tmp', 'ir', 'adh', 'adl', 'p'] else ''}{dest}_load_en"] = True
+                elif dest == "pc":
+                    signals["pc_load_en"] = True
                 elif dest.startswith('*'):
                     signals["mem_write_en"] = True
                     signals["data_bus_out_en"] = True
@@ -157,11 +173,18 @@ def generate_microcode(symbolic_code: str) -> tuple[int, int, int]:
                     if "+ y" in dest_addr:
                         signals["y_add_to_addr_en"] = True
                         dest_addr = dest_addr.replace("+ y", "").strip()
-                    if dest_addr == "{0x00, adl}": signals["addr_source_key"] = "zeropage"
-                    elif dest_addr == "{latch}" or dest_addr == "{adh, adl}": signals["addr_source_key"] = "latch"
-                    elif dest_addr == "sp": signals["addr_source_key"] = "stack"
+                    if dest_addr.startswith('{') and dest_addr.endswith('}'):
+                        key = dest_addr[1:-1]
+                        if key == "0x00, adl":
+                            signals["addr_source_key"] = "zeropage"
+                        elif key == "latch":
+                            signals["addr_source_key"] = "latch"
+                        elif key in ADDR_SOURCE_CODES:
+                            signals["addr_source_key"] = key
+                    elif dest_addr == "sp":
+                        signals["addr_source_key"] = "stack"
 
-    # --- ASSEMBLER - Składanie słów mikrokodu ---
+    # --- Złożenie słów ---
     w2 = ((1 if signals["alu_flags_ld"] else 0) << 15 |
           ALU_OP_CODES.get(signals["alu_op_key"], 0) << 11 |
           (1 if signals["reg_a_load_en"] else 0) << 10 |
@@ -188,7 +211,8 @@ def generate_microcode(symbolic_code: str) -> tuple[int, int, int]:
           (1 if signals["data_bus_in_en"] else 0) << 1 |
           (1 if signals["data_bus_out_en"] else 0))
 
-    w0 = ((1 if signals["p_c_set_en"] else 0) << 14 |
+    w0 = ((1 if signals["p_b_force_one_en"] else 0) << 15 |
+          (1 if signals["p_c_set_en"] else 0) << 14 |
           (1 if signals["p_c_clr_en"] else 0) << 13 |
           (1 if signals["p_d_set_en"] else 0) << 12 |
           (1 if signals["p_d_clr_en"] else 0) << 11 |
@@ -206,22 +230,22 @@ def generate_microcode(symbolic_code: str) -> tuple[int, int, int]:
 
 
 # ==============================================================================
-#  SEKCJA 3: FUNKCJE POMOCNICZE
+#  SEKCJA 3: FUNKCJE POMOCNICZE (Z ZAPISEM DO FOLDERU)
 # ==============================================================================
 def translate_instruction(name: str, cycles: list):
-    """Tłumaczy całą instrukcję i drukuje wyniki w czytelnej formie."""
     print(f"--- Mikrokod dla instrukcji: {name} ---")
     for i, cycle_code in enumerate(cycles):
         w2, w1, w0 = generate_microcode(cycle_code)
-        print(f"Cykl {i}: {cycle_code:<48} -> W2=0x{w2:04X}, W1=0x{w1:04X}, W0=0x{w0:04X}")
-    print("-" * (73 + len(name)))
+        print(f"Cykl {i}: {cycle_code:<55} -> W2={w2:04X}, W1={w1:04X}, W0={w0:04X}")
+    print("-" * 80)
 
 
 def generate_rom_files(microcode_map, num_opcodes=256, max_cycles=8):
-    """
-    Generuje 24 pliki tekstowe dla architektury ROM z 8 bankami.
-    """
-    print("\n--- Generowanie plików tekstowych ROM ---")
+    print(f"\n--- Generowanie plików tekstowych ROM w katalogu '{OUTPUT_DIR}' ---")
+
+    # Upewnij się, że katalog istnieje
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
 
     num_banks = max_cycles
     words_per_bank = num_opcodes
@@ -238,31 +262,36 @@ def generate_rom_files(microcode_map, num_opcodes=256, max_cycles=8):
 
             w2, w1, w0 = generate_microcode(symbolic_code)
 
-            bank_index = cycle_index
-            address_in_bank = opcode
-
-            roms_w2[bank_index][address_in_bank] = f"{w2:04X}"
-            roms_w1[bank_index][address_in_bank] = f"{w1:04X}"
-            roms_w0[bank_index][address_in_bank] = f"{w0:04X}"
+            roms_w2[cycle_index][opcode] = f"{w2:04X}"
+            roms_w1[cycle_index][opcode] = f"{w1:04X}"
+            roms_w0[cycle_index][opcode] = f"{w0:04X}"
 
     try:
         for i in range(num_banks):
-            with open(f"w2_bank{i}.txt", "w") as f:
-                f.write("\n".join(roms_w2[i]))
-            with open(f"w1_bank{i}.txt", "w") as f:
-                f.write("\n".join(roms_w1[i]))
-            with open(f"w0_bank{i}.txt", "w") as f:
-                f.write("\n".join(roms_w0[i]))
+            # Zapisz pliki w katalogu OUTPUT_DIR
+            path_w2 = os.path.join(OUTPUT_DIR, f"w2_bank{i}.txt")
+            path_w1 = os.path.join(OUTPUT_DIR, f"w1_bank{i}.txt")
+            path_w0 = os.path.join(OUTPUT_DIR, f"w0_bank{i}.txt")
+
+            with open(path_w2, "w") as f: f.write("\n".join(roms_w2[i]))
+            with open(path_w1, "w") as f: f.write("\n".join(roms_w1[i]))
+            with open(path_w0, "w") as f: f.write("\n".join(roms_w0[i]))
+
         print(f"Pomyślnie wygenerowano {num_banks * 3} plików tekstowych.")
     except IOError as e:
         print(f"Błąd podczas zapisu plików tekstowych: {e}")
 
 
 def generate_csv_log(microcode_map):
-    """Generuje plik CSV z kompletnym logiem mikrokodu."""
-    print("\n--- Generowanie pliku logu CSV ---")
+    print(f"\n--- Generowanie logu CSV w katalogu '{OUTPUT_DIR}' ---")
+
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    log_path = os.path.join(OUTPUT_DIR, "microcode_log.csv")
+
     try:
-        with open("microcode_log.csv", "w", newline="", encoding="utf-8") as f:
+        with open(log_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(['Opcode', 'Mnemonic', 'Addressing', 'Cycle', 'Symbolic Code', 'W2', 'W1', 'W0'])
 
@@ -276,17 +305,15 @@ def generate_csv_log(microcode_map):
                         addressing_mode,
                         cycle_index,
                         symbolic_code if symbolic_code else "NO-OP",
-                        f"{w2:04X}",
-                        f"{w1:04X}",
-                        f"{w0:04X}"
+                        f"{w2:04X}", f"{w1:04X}", f"{w0:04X}"
                     ])
-        print("Pomyślnie wygenerowano plik microcode_log.csv")
+        print(f"Pomyślnie wygenerowano plik {log_path}")
     except IOError as e:
         print(f"Błąd podczas zapisu pliku CSV: {e}")
 
 
 # ==============================================================================
-#  SEKCJA 4: GŁÓWNY BLOK WYKONAWCZY
+#  SEKCJA 4: MAIN
 # ==============================================================================
 if __name__ == "__main__":
     print("--- Walidacja mapy mikrokodu ---")
@@ -294,24 +321,19 @@ if __name__ == "__main__":
     for opcode, data in MICROCODE_MAP.items():
         mnemonic, addressing_mode, cycles = data
         if len(cycles) > 8:
-            print(
-                f"BŁĄD KRYTYCZNY: Instrukcja ${opcode:02X} ({mnemonic} {addressing_mode}) ma {len(cycles)} cykli (limit to 8)!")
+            print(f"BŁĄD: {mnemonic} {addressing_mode} (Opcode {opcode:02X}) ma {len(cycles)} cykli!")
             error_found = True
 
-    if error_found:
-        print("Przerwano kompilację z powodu błędów.")
-        exit(1)
-    else:
-        print("Walidacja zakończona pomyślnie.")
+    if not error_found:
+        print("Walidacja długości cykli OK.")
 
-    print("\n--- Tłumaczenie mikrokodów dla weryfikacji ---")
-    if not MICROCODE_MAP:
-        print("Mapa mikrokodu (MICROCODE_MAP) jest pusta.")
-    else:
-        for opcode, data in sorted(MICROCODE_MAP.items()):
-            mnemonic, addressing_mode, cycles = data
-            translate_instruction(f"{opcode:02X} ({mnemonic} {addressing_mode})", cycles)
-            print()
+        test_opcodes = [0xA9, 0x69, 0xBD, 0xF0, 0x4C]
+        for op in test_opcodes:
+            if op in MICROCODE_MAP:
+                data = MICROCODE_MAP[op]
+                translate_instruction(f"{data[0]} {data[1]}", data[2])
 
-    generate_rom_files(MICROCODE_MAP)
-    generate_csv_log(MICROCODE_MAP)
+        generate_rom_files(MICROCODE_MAP)
+        generate_csv_log(MICROCODE_MAP)
+    else:
+        print("Popraw błędy przed generowaniem plików.")

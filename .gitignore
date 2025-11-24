@@ -8,7 +8,6 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
 develop-eggs/
 dist/
 downloads/
@@ -208,6 +207,5 @@ __marimo__/
 
 # Ignoruj pliki projektu IDE (IntelliJ, PyCharm, WebStorm etc.)
 .idea/
-# # Ignoruj logi generowane przez skrypty
-microcode_log.csv
+
 
