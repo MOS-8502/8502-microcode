@@ -269,9 +269,9 @@ def generate_rom_files(microcode_map, num_opcodes=256, max_cycles=8):
     try:
         for i in range(num_banks):
             # Zapisz pliki w katalogu OUTPUT_DIR
-            path_w2 = os.path.join(OUTPUT_DIR, f"w2_bank{i}.txt")
-            path_w1 = os.path.join(OUTPUT_DIR, f"w1_bank{i}.txt")
-            path_w0 = os.path.join(OUTPUT_DIR, f"w0_bank{i}.txt")
+            path_w2 = os.path.join(OUTPUT_DIR, f"w2b{i}.rom")
+            path_w1 = os.path.join(OUTPUT_DIR, f"w1b{i}.rom")
+            path_w0 = os.path.join(OUTPUT_DIR, f"w0b{i}.rom")
 
             with open(path_w2, "w") as f: f.write("\n".join(roms_w2[i]))
             with open(path_w1, "w") as f: f.write("\n".join(roms_w1[i]))
